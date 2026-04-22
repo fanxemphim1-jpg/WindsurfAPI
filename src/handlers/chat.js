@@ -261,6 +261,7 @@ export async function handleChatCompletions(body) {
   const reuseEnabled = useCascade && isExperimentalEnabled('cascadeConversationReuse');
   const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey) : null;
   let reuseEntry = reuseEnabled ? poolCheckout(fpBefore) : null;
+  let checkedOutReuseEntry = reuseEntry;
   if (reuseEntry) log.info(`Chat[${reqId}]: reuse HIT cascade=${reuseEntry.cascadeId.slice(0, 8)} model=${displayModel}`);
 
   // Non-stream: retry with a different account on model-not-available errors
@@ -320,6 +321,7 @@ export async function handleChatCompletions(body) {
     // born on has been replaced, the cascade_id is dead.
     if (reuseEntry && reuseEntry.lsPort !== ls.port) {
       log.info(`Chat[${reqId}]: reuse MISS — LS port changed`);
+      checkedOutReuseEntry = null;
       reuseEntry = null;
     }
     const _msgChars = (messages || []).reduce((n, m) => {
@@ -354,8 +356,16 @@ export async function handleChatCompletions(body) {
   if (!lastErr || lastErr.status === 429) {
     const rl = isAllRateLimited(modelKey);
     if (rl.allLimited) {
+      if (checkedOutReuseEntry && fpBefore) {
+        poolCheckin(fpBefore, checkedOutReuseEntry);
+        log.info(`Chat[${reqId}]: restored checked-out cascade after rate limit`);
+      }
       return { status: 429, body: { error: { message: `${displayModel} 所有账号均已达速率限制，请 ${Math.ceil(rl.retryAfterMs / 1000)} 秒后重试`, type: 'rate_limit_exceeded', retry_after_ms: rl.retryAfterMs } } };
     }
+  }
+  if (checkedOutReuseEntry && fpBefore) {
+    poolCheckin(fpBefore, checkedOutReuseEntry);
+    log.info(`Chat[${reqId}]: restored checked-out cascade after failed request`);
   }
   return lastErr || { status: 503, body: { error: { message: 'No active accounts available', type: 'pool_exhausted' } } };
 }
@@ -598,6 +608,7 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
       const reuseEnabled = useCascade && isExperimentalEnabled('cascadeConversationReuse');
       const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey) : null;
       let reuseEntry = reuseEnabled ? poolCheckout(fpBefore) : null;
+      let checkedOutReuseEntry = reuseEntry;
       if (reuseEntry) log.info(`Chat: cascade reuse HIT cascadeId=${reuseEntry.cascadeId.slice(0, 8)}… stream model=${model}`);
 
       // Always strip <tool_call>/<tool_result> blocks in Cascade mode.
@@ -733,6 +744,7 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
           if (!ls) { lastErr = new Error('No LS instance available'); break; }
           if (reuseEntry && reuseEntry.lsPort !== ls.port) {
             log.info(`Chat[${reqId}]: reuse MISS — LS port changed`);
+            checkedOutReuseEntry = null;
             reuseEntry = null;
           }
           const _msgCharsStream = (messages || []).reduce((n, m) => {
@@ -836,6 +848,10 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
           const errMsg = rl.allLimited
             ? `${model} 所有账号均已达速率限制，请 ${Math.ceil(rl.retryAfterMs / 1000)} 秒后重试`
             : sanitizeText(lastErr?.message || 'no accounts');
+          if (!hadSuccess && checkedOutReuseEntry && fpBefore) {
+            poolCheckin(fpBefore, checkedOutReuseEntry);
+            log.info(`Chat[${reqId}]: restored checked-out cascade after failed stream`);
+          }
 
           if (hadSuccess) {
             // We already streamed real assistant content. Injecting
