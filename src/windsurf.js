@@ -306,9 +306,11 @@ export function buildSendCascadeMessageRequest(apiKey, cascadeId, text, modelEnu
   parts.push(writeMessageField(3, buildMetadata(apiKey, undefined, sessionId)));
 
   // Field 5: cascade_config
-  // When images are present, use DEFAULT planner mode (1) instead of NO_TOOL (3)
-  // because NO_TOOL disables the vision pipeline on the Windsurf backend.
-  const cascadeConfig = buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault: !!images?.length });
+  // DEFAULT mode enables vision but also activates Cascade's built-in tools
+  // which conflict with our emulated tools. Only use DEFAULT when images are
+  // present AND no client tools — otherwise NO_TOOL for clean tool emulation.
+  const forceDefault = !!images?.length && !toolPreamble;
+  const cascadeConfig = buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault });
   parts.push(writeMessageField(5, cascadeConfig));
 
   // Field 6: images — repeated ImageData { base64_data=1, mime_type=2 }
