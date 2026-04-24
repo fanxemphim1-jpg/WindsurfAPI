@@ -28,6 +28,58 @@ const HEARTBEAT_MS = 15_000;
 const QUEUE_RETRY_MS = 1_000;
 const QUEUE_MAX_WAIT_MS = 30_000;
 
+/**
+ * Extract a clean JSON payload from a model response. Handles three common
+ * shapes a non-constrained-decoding model produces when asked for JSON:
+ *
+ *   1. Fenced code block:   ```json\n{...}\n```
+ *   2. Preamble + fence:    Here is the JSON:\n```\n{...}\n```
+ *   3. Bare JSON with noise: Sure! {...} Let me know if ...
+ *
+ * Returns the raw (unparsed) JSON substring so the caller can serialize it
+ * straight through. Falls back to the trimmed original text if nothing
+ * parseable is found, matching what OpenAI's json_object mode does when the
+ * model produces invalid JSON (the response still flows, parsing is the
+ * caller's responsibility).
+ */
+function extractJsonPayload(text) {
+  if (!text) return text;
+  // 1. Fenced code block — most common with Cascade
+  const fence = text.match(/```(?:json|JSON)?\s*\n?([\s\S]*?)\n?```/);
+  if (fence) {
+    const inner = fence[1].trim();
+    try { JSON.parse(inner); return inner; } catch { /* fall through */ }
+  }
+  // 2. Scan for the first balanced {...} or [...] block that parses
+  const trimmed = text.trim();
+  for (let start = 0; start < trimmed.length; start++) {
+    const ch = trimmed[start];
+    if (ch !== '{' && ch !== '[') continue;
+    const open = ch;
+    const close = ch === '{' ? '}' : ']';
+    let depth = 0;
+    let inStr = false;
+    let escape = false;
+    for (let i = start; i < trimmed.length; i++) {
+      const c = trimmed[i];
+      if (escape) { escape = false; continue; }
+      if (c === '\\' && inStr) { escape = true; continue; }
+      if (c === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (c === open) depth++;
+      else if (c === close) {
+        depth--;
+        if (depth === 0) {
+          const candidate = trimmed.slice(start, i + 1);
+          try { JSON.parse(candidate); return candidate; } catch { /* keep scanning */ }
+          break;
+        }
+      }
+    }
+  }
+  return trimmed;
+}
+
 // ── Language-following reinforcement ──────────────────────────
 // Claude Code injects ~100KB of English system prompt + tool definitions
 // into the conversation, which drowns out the communication_section
@@ -326,7 +378,7 @@ export async function handleChatCompletions(body) {
   const ckey = cacheKey(body);
 
   if (stream) {
-    return streamResponse(chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, reqId);
+    return streamResponse(chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, reqId, wantJson);
   }
 
   // ── Local response cache (exact body match) ─────────────
@@ -572,8 +624,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     allText = sanitizeText(allText);
     allText = neutralizeCascadeIdentity(allText, model);
     if (wantJson && allText) {
-      const fenceMatch = allText.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-      if (fenceMatch) allText = fenceMatch[1].trim();
+      allText = extractJsonPayload(allText);
     }
     allThinking = sanitizeText(allThinking);
     if (toolCalls.length) {
@@ -687,7 +738,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
   }
 }
 
-function streamResponse(id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, reqId) {
+function streamResponse(id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, reqId, wantJson = false) {
   return {
     status: 200,
     stream: true,
@@ -794,6 +845,11 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
       const emitContent = (clean) => {
         if (!clean) return;
         accText += clean;
+        // When response_format=json_object/json_schema is set, buffer text
+        // instead of streaming it out. We can't safely fence-strip in the
+        // middle of a stream (fence might straddle a chunk, and we'd need
+        // lookahead). On finish we'll emit one clean JSON payload.
+        if (wantJson) return;
         send({ id, object: 'chat.completion.chunk', created, model,
           choices: [{ index: 0, delta: { content: clean }, finish_reason: null }] });
       };
@@ -977,6 +1033,18 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             if (!rolePrinted) {
               send({ id, object: 'chat.completion.chunk', created, model,
                 choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+            }
+            // For response_format=json_* we buffered all content — flush one
+            // clean JSON payload now. extractJsonPayload strips fences and
+            // any preamble text, returning raw parseable JSON (or the
+            // trimmed original when nothing parses).
+            if (wantJson && accText) {
+              const cleaned = extractJsonPayload(accText);
+              if (cleaned) {
+                send({ id, object: 'chat.completion.chunk', created, model,
+                  choices: [{ index: 0, delta: { content: cleaned }, finish_reason: null }] });
+                accText = cleaned;
+              }
             }
             const finalReason = collectedToolCalls.length ? 'tool_calls' : 'stop';
             // OpenAI spec: the finish_reason chunk carries NO usage, then a

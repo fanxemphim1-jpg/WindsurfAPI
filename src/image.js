@@ -48,6 +48,15 @@ export function parseDataUrl(url) {
   return { base64_data: m[2], mime_type: m[1].toLowerCase() };
 }
 
+// Extract base64 body from a data URL of any mime type. Used for PDF
+// payloads which don't match parseDataUrl's image-only regex.
+export function parseGenericDataUrl(url) {
+  const clean = url.replace(/\s/g, '');
+  const m = clean.match(/^data:([a-z0-9][a-z0-9.+/-]+);base64,(.+)$/i);
+  if (!m) return null;
+  return { base64_data: m[2], mime_type: m[1].toLowerCase() };
+}
+
 export function fetchImageUrl(url, timeoutMs = 8000, _depth = 0) {
   if (_depth > MAX_REDIRECTS) return Promise.reject(new Error('Too many image redirects'));
   validateImageUrl(url);
@@ -134,12 +143,50 @@ export async function extractImages(contentBlocks) {
       const url = block.image_url?.url || '';
       try {
         if (url.startsWith('data:')) {
+          // PDF-as-data-URL: let the model "see" it via text extraction
+          // rather than treating it as an unsupported image type.
+          const lower = url.slice(0, 40).toLowerCase();
+          if (lower.startsWith('data:application/pdf')) {
+            const g = parseGenericDataUrl(url);
+            if (g?.base64_data) {
+              const pdf = tryExtractPdf(g.base64_data);
+              if (pdf?.text) {
+                text += `\n[PDF Document — ${pdf.pageCount} page(s)]\n${pdf.text}\n`;
+                log.info(`PDF extracted (image_url data URL): ${pdf.pageCount} pages, ${pdf.text.length} chars`);
+              } else {
+                text += '\n[PDF Document — no extractable text (scanned/image-only PDF)]\n';
+              }
+            }
+            continue;
+          }
           const parsed = parseDataUrl(url);
           if (parsed) images.push(parsed);
         } else if (url.startsWith('https://') || url.startsWith('http://')) {
           images.push(await fetchImageUrl(url));
         }
       } catch (e) { log.warn(`Image fetch failed: ${e.message}`); }
+    } else if (block.type === 'file' || block.type === 'input_file') {
+      // OpenAI PDF input: { type:'file', file:{ filename, file_data:'data:application/pdf;base64,...' } }
+      // or file_id (uploaded via Files API — we can't fetch, so ignore).
+      const file = block.file || {};
+      const dataUrl = file.file_data || file.url || '';
+      if (dataUrl.startsWith('data:application/pdf')) {
+        const g = parseGenericDataUrl(dataUrl);
+        if (g?.base64_data) {
+          const pdf = tryExtractPdf(g.base64_data);
+          if (pdf?.text) {
+            const label = file.filename ? ` "${file.filename}"` : '';
+            text += `\n[PDF Document${label} — ${pdf.pageCount} page(s)]\n${pdf.text}\n`;
+            log.info(`PDF extracted (OpenAI file block): ${pdf.pageCount} pages, ${pdf.text.length} chars`);
+          } else {
+            text += '\n[PDF Document — no extractable text (scanned/image-only PDF)]\n';
+          }
+        }
+      } else if (dataUrl && !file.file_id) {
+        log.warn(`Unsupported file block data URL: ${dataUrl.slice(0, 40)}...`);
+      } else if (file.file_id) {
+        log.warn(`File block references file_id=${file.file_id} — upload API not supported, skipping`);
+      }
     }
   }
 
