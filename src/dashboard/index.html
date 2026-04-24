@@ -2545,31 +2545,27 @@ const App = {
         const planName = cr.planName || '-';
         const fetchedAgo = cr.fetchedAt ? Math.round((Date.now() - cr.fetchedAt) / 60000) + 'm ago' : '-';
         const barColor = (v) => v == null ? 'var(--text-dim)' : v <= 10 ? 'var(--error)' : v <= 30 ? 'var(--warn, #f59e0b)' : 'var(--success, #10b981)';
-        const bar = (label, pct) => {
+        const bar = (label, pct, detail) => {
           if (pct == null) return '';
           const v = Math.max(0, Math.min(100, pct));
           const c = barColor(v);
-          return `<div style="display:flex;align-items:center;gap:4px;margin-top:2px">
-            <span class="text-xs" style="width:28px;flex-shrink:0;color:var(--text-dim)">${label}</span>
-            <div style="flex:1;height:4px;background:var(--surface-3);border-radius:2px;overflow:hidden">
-              <div style="height:100%;width:${v}%;background:${c};transition:width .3s"></div>
+          return `<div style="display:flex;align-items:center;gap:3px;margin-top:3px" title="${detail || ''}">
+            <span class="text-xs" style="width:16px;flex-shrink:0;color:var(--text-dim);font-size:10px">${label}</span>
+            <div style="flex:1;height:5px;background:var(--surface-3);border-radius:3px;overflow:hidden;min-width:50px">
+              <div style="height:100%;width:${v}%;background:${c};border-radius:3px;transition:width .3s"></div>
             </div>
-            <span class="text-xs" style="width:28px;text-align:right;color:${c}">${v.toFixed(0)}%</span>
+            <span class="text-xs" style="width:30px;text-align:right;color:${c};font-size:10px">${v.toFixed(0)}%</span>
           </div>`;
         };
         const promptPct = cr.prompt?.limit ? ((cr.prompt.remaining || 0) / cr.prompt.limit) * 100 : null;
-        const tipLines = [
-          `Plan: ${planName}`,
-          cr.dailyResetAt ? `Daily reset: ${new Date(cr.dailyResetAt * 1000).toLocaleString()}` : '',
-          cr.weeklyResetAt ? `Weekly reset: ${new Date(cr.weeklyResetAt * 1000).toLocaleString()}` : '',
-          cr.flex?.limit ? `Flex: ${(cr.flex.used || 0).toFixed(0)}/${cr.flex.limit.toFixed(0)}` : '',
-          `Updated: ${fetchedAgo}`,
-        ].filter(Boolean).join('\n');
-        creditCell = `<div style="min-width:120px" title="${this.esc(tipLines)}">
-            <div class="text-xs" style="margin-bottom:2px"><b>${this.esc(planName.slice(0, 12))}</b> <span style="color:var(--text-dim)">${fetchedAgo}</span></div>
-            ${bar(I18n.t('creditsBar.daily'), cr.dailyPercent)}${cr.dailyPercent != null ? `<span class="text-xs text-dim" style="margin-left:32px;margin-top:-2px;display:block">${cr.dailyResetAt ? '重置: ' + new Date(cr.dailyResetAt * 1000).toLocaleTimeString() : ''}</span>` : ''}
-            ${bar(I18n.t('creditsBar.weekly'), cr.weeklyPercent)}
-            ${bar('提示词', promptPct)}${promptPct != null && cr.prompt ? `<span class="text-xs text-dim" style="margin-left:32px;margin-top:-2px;display:block">${cr.prompt.remaining || 0}/${cr.prompt.limit} 剩余</span>` : ''}
+        const dailyTip = cr.dailyResetAt ? I18n.t('creditsBar.daily') + ' — ' + new Date(cr.dailyResetAt * 1000).toLocaleString() : '';
+        const weeklyTip = cr.weeklyResetAt ? I18n.t('creditsBar.weekly') + ' — ' + new Date(cr.weeklyResetAt * 1000).toLocaleString() : '';
+        const promptTip = cr.prompt?.limit ? `${cr.prompt.remaining || 0} / ${cr.prompt.limit}` : '';
+        creditCell = `<div style="min-width:130px;max-width:180px">
+            <div class="text-xs" style="margin-bottom:3px"><b>${this.esc(planName.slice(0, 12))}</b> <span style="color:var(--text-dim)">${fetchedAgo}</span></div>
+            ${bar('D', cr.dailyPercent, dailyTip)}
+            ${bar('W', cr.weeklyPercent, weeklyTip)}
+            ${bar('P', promptPct, promptTip)}
           </div>`;
       }
       return `

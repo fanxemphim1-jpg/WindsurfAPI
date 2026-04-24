@@ -144,9 +144,9 @@
   },
 
   "creditsBar": {
-    "daily": "Daily",
-    "weekly": "Weekly",
-    "monthly": "Monthly"
+    "daily": "Daily Quota",
+    "weekly": "Weekly Quota",
+    "monthly": "Monthly Quota"
   },
 
   "section": {
