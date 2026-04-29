@@ -30,6 +30,25 @@ const HEARTBEAT_MS = 15_000;
 const QUEUE_RETRY_MS = 1_000;
 const QUEUE_MAX_WAIT_MS = 30_000;
 
+// Strict positive int env reader (mirrors helper in auth.js / client.js).
+function positiveIntEnv(name, fallback) {
+  const n = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+// When preflight reports `hasCapacity=false` but upstream omits a concrete
+// retryAfterMs hint, we still need to take the account out of rotation —
+// otherwise getApiKey() picks the same exhausted account on the next request
+// and we either burn another preflight check or hit a 429 on the upstream
+// chat call. Default to a short cooldown so a recovered account re-enters
+// rotation quickly; configurable via PREFLIGHT_NO_HINT_COOLDOWN_MS.
+const PREFLIGHT_NO_HINT_COOLDOWN_MS = positiveIntEnv('PREFLIGHT_NO_HINT_COOLDOWN_MS', 60_000);
+
+function preflightCooldownMs(rl) {
+  if (Number.isFinite(rl?.retryAfterMs) && rl.retryAfterMs > 0) return rl.retryAfterMs;
+  return PREFLIGHT_NO_HINT_COOLDOWN_MS;
+}
+
 // Build the option bag the v2.0.25 semantic key needs. tools / tool_choice /
 // preamble are baked into the digest so a tool schema change misses instead
 // of silently resuming a cascade where the upstream model has the old tool
@@ -1230,9 +1249,11 @@ export async function handleChatCompletions(body, context = {}) {
         if (!rl.hasCapacity) {
           log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
           refundReservation(acct.apiKey, acct.reservationTimestamp);
-          if (Number.isFinite(rl.retryAfterMs) && rl.retryAfterMs > 0) {
-            markRateLimited(acct.apiKey, rl.retryAfterMs, routingModelKey);
-          }
+          // Always mark this account+model rate-limited so getApiKey() drops
+          // it from rotation. Without this, the same exhausted account is
+          // picked again on the next request and we either burn another
+          // preflight check or hit a real 429 on the upstream chat call.
+          markRateLimited(acct.apiKey, preflightCooldownMs(rl), routingModelKey);
           if (!reuseEntryDead && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
             const availability = getAccountAvailability(acct.apiKey, routingModelKey);
             const retryAfterMs = strictReuseRetryMs(availability);
@@ -1516,8 +1537,11 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     if (isAuthFail) reportError(apiKey);
     if (isRateLimit) { markRateLimited(apiKey, rateLimitCooldownMs(err.message), modelKey); err.isRateLimit = true; err.isModelError = true; err.kind ||= 'model_error'; }
     if (isInternal) { reportInternalError(apiKey); err.isModelError = true; err.kind ||= 'transient_stall'; }
-    if (isTransport) { err.isModelError = true; err.kind ||= 'transient_stall'; }
-    if (err.isModelError && err.kind !== 'transient_stall' && !isRateLimit && !isInternal) {
+    // Transport errors always win the kind field — even if a Cascade error
+    // step pre-stamped err.kind = 'model_error', we don't want to call
+    // updateCapability() and disable the model on a transient transport blip.
+    if (isTransport) { err.isModelError = true; err.kind = 'transient_stall'; }
+    if (err.isModelError && err.kind !== 'transient_stall' && !isRateLimit && !isInternal && !isTransport) {
       updateCapability(apiKey, modelKey, false, 'model_error');
     }
     recordRequest(model, false, Date.now() - startTime, apiKey);
@@ -1857,9 +1881,8 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
               if (!rl.hasCapacity) {
                 log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
                 refundReservation(acct.apiKey, acct.reservationTimestamp);
-                if (Number.isFinite(rl.retryAfterMs) && rl.retryAfterMs > 0) {
-                  markRateLimited(acct.apiKey, rl.retryAfterMs, modelKey);
-                }
+                // Always mark — see non-stream branch above for rationale.
+                markRateLimited(acct.apiKey, preflightCooldownMs(rl), modelKey);
                 if (!reuseEntryDead && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
                   const availability = getAccountAvailability(acct.apiKey, modelKey);
                   const retryAfterMs = strictReuseRetryMs(availability);
@@ -1988,8 +2011,8 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             if (isAuthFail) reportError(currentApiKey);
             if (isRateLimit) { markRateLimited(currentApiKey, rateLimitCooldownMs(err.message), modelKey); err.isRateLimit = true; err.isModelError = true; err.kind ||= 'model_error'; }
             if (isInternal) { reportInternalError(currentApiKey); err.isModelError = true; err.kind ||= 'transient_stall'; }
-            if (isTransport) { err.isModelError = true; err.kind ||= 'transient_stall'; }
-            if (err.isModelError && err.kind !== 'transient_stall' && !isRateLimit && !isInternal) {
+            if (isTransport) { err.isModelError = true; err.kind = 'transient_stall'; }
+            if (err.isModelError && err.kind !== 'transient_stall' && !isRateLimit && !isInternal && !isTransport) {
               updateCapability(currentApiKey, modelKey, false, 'model_error');
             }
             if (isRateLimit && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === currentApiKey) {

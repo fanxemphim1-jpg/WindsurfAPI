@@ -31,9 +31,24 @@ import {
 
 const LS_SERVICE = '/exa.language_server_pb.LanguageServerService';
 
+// Patterns that mean "the upstream transport / Cascade session blew up,
+// retry on a different account/cascade is safe and expected".
+//
+// Includes:
+//   - Local LS / HTTP/2 jitter (pending stream canceled, session/stream
+//     closed, ERR_HTTP2*, ECONNRESET, panel state churn).
+//   - Upstream-classified retryable errors. Codeium streams these back as
+//     `Encountered retryable error from model provider: context deadline
+//     exceeded (Client.Timeout or context cancellation while reading body)`
+//     when the model provider drops the long-poll body — without this
+//     classification the chat retry loop misses err.isModelError, declines
+//     to try another account, and surfaces "upstream_error" to the client
+//     even though a fresh account would almost certainly succeed.
+const TRANSPORT_ERROR_RE = /pending stream has been canceled|ECONNRESET|ERR_HTTP2|session closed|stream closed|panel state|context deadline exceeded|client\.timeout|context cancellation|retryable error from model provider|read ETIMEDOUT|socket hang up|unexpected eof/i;
+
 export function isCascadeTransportError(err) {
   const msg = String(err?.message || err || '');
-  return /pending stream has been canceled|ECONNRESET|ERR_HTTP2|session closed|stream closed|panel state/i.test(msg);
+  return TRANSPORT_ERROR_RE.test(msg);
 }
 
 function markCascadeTransportError(err) {
@@ -694,7 +709,15 @@ export class WindsurfClient {
             log.warn('Cascade error step', { errorText: step.errorText.trim(), trail });
             const err = new Error(step.errorText.trim());
             err.isModelError = true;
-            err.kind = 'model_error';
+            // Upstream sometimes wraps transport-class failures in an error
+            // step (e.g. "Encountered retryable error from model provider:
+            // context deadline exceeded ..."). Classifying these as
+            // 'model_error' would call updateCapability() and disable the
+            // model on this account permanently — but the next request on
+            // a fresh account almost always succeeds. Demote to
+            // 'transient_stall' so the chat retry loop re-tries on another
+            // account without poisoning capability state.
+            err.kind = isCascadeTransportError(err) ? 'transient_stall' : 'model_error';
             throw err;
           }
         }

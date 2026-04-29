@@ -48,6 +48,28 @@ describe('stream error protocol', () => {
     assert.equal(isUpstreamTransientError(new Error('permission_denied: model unavailable')), false);
   });
 
+  it('classifies upstream "context deadline exceeded" / Client.Timeout / retryable errors as transient', () => {
+    // Codeium streams these strings back when the model provider drops the
+    // long-poll body. Without classifying as transport, the retry loop
+    // treats them as model_error and gives up after the first account.
+    const cases = [
+      'Encountered retryable error from model provider: context deadline exceeded (Client.Timeout or context cancellation while reading body)',
+      'context deadline exceeded',
+      'Client.Timeout exceeded while awaiting headers',
+      'context cancellation while reading body',
+      'read ETIMEDOUT',
+      'socket hang up',
+    ];
+    for (const msg of cases) {
+      const err = new Error(msg);
+      assert.equal(isCascadeTransportError(err), true, `expected transport for: ${msg}`);
+      assert.equal(isUpstreamTransientError(err), true, `expected transient for: ${msg}`);
+    }
+    // Negative case — a genuine model error must still NOT be classified
+    // as transient (otherwise we'd silently retry permanent failures).
+    assert.equal(isCascadeTransportError(new Error('permission_denied: model unavailable')), false);
+  });
+
   it('redacts common secret patterns before debug request-body logging', () => {
     const redacted = redactRequestLogText('sk-1234567890abcdefghijklmnop test@example.com Cookie: session=abc eyJabc.def.ghi AKIAABCDEFGHIJKLMNOP');
     assert.doesNotMatch(redacted, /sk-1234567890/);

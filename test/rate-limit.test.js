@@ -30,7 +30,14 @@ afterEach(() => {
 });
 
 describe('rate-limit handling', () => {
-  it('does not poison local cooldowns when preflight has no retryAfter hint', async () => {
+  it('marks the account locally when preflight reports no capacity (with or without retry hint)', async () => {
+    // Regression for the "preflight rate limiting is broken" bug:
+    // when upstream returns hasCapacity=false but omits retryAfterMs, the
+    // old code skipped markRateLimited entirely. The same exhausted account
+    // would then be picked again on the next request, burning another
+    // preflight check (or hitting a real upstream 429). Now we always mark
+    // — using upstream's retryAfterMs when present, otherwise a default
+    // cooldown — so the account exits rotation until it can recover.
     const account = addTestAccount('preflight-no-hint');
     let checks = 0;
     setExperimental({ preflightRateLimit: true });
@@ -53,10 +60,43 @@ describe('rate-limit handling', () => {
     const second = await handleChatCompletions(request, context);
     const listed = getAccountList().find(a => a.id === account.id);
 
-    assert.equal(first.status, 503);
-    assert.equal(second.status, 503);
-    assert.equal(checks, 2);
-    assert.deepEqual(listed.modelRateLimits, {});
+    // First request: preflight detects no capacity, marks rate-limited,
+    // surfaces 429 (all eligible accounts now rate-limited for this model).
+    assert.equal(first.status, 429);
+    assert.equal(first.body.error.type, 'rate_limit_exceeded');
+    // Second request: account is locally rate-limited, getApiKey() drops it
+    // before we ever call preflight — so the upstream check is NOT burned
+    // again. waitForAccount finds nothing eligible and returns 429.
+    assert.equal(second.status, 429);
+    assert.equal(checks, 1);
+    // The per-model cooldown is recorded with the env-configurable default.
+    assert.ok(listed.modelRateLimits['gemini-2.5-flash'] > Date.now());
+  });
+
+  it('honours upstream retryAfterMs when preflight provides one', async () => {
+    const account = addTestAccount('preflight-with-hint');
+    setExperimental({ preflightRateLimit: true });
+
+    const before = Date.now();
+    const HINTED_MS = 12_000;
+    const context = {
+      async checkMessageRateLimit() {
+        return { hasCapacity: false, messagesRemaining: 0, maxMessages: 1, retryAfterMs: HINTED_MS };
+      },
+      async waitForAccount(tried, signal, maxWaitMs, modelKey) {
+        return tried.length === 0 ? getApiKey(tried, modelKey) : null;
+      },
+    };
+
+    await handleChatCompletions({
+      model: 'gemini-2.5-flash',
+      messages: [{ role: 'user', content: 'hi' }],
+    }, context);
+
+    const listed = getAccountList().find(a => a.id === account.id);
+    const cooldownUntil = listed.modelRateLimits['gemini-2.5-flash'];
+    assert.ok(cooldownUntil >= before + HINTED_MS - 1000);
+    assert.ok(cooldownUntil <= before + HINTED_MS + 2000);
   });
 
   it('parses explicit retry-after seconds instead of defaulting to five minutes', () => {
@@ -139,7 +179,10 @@ describe('rate-limit handling', () => {
       },
     });
 
-    assert.equal(result.status, 503);
+    // Account is now locally rate-limited (regression-fixed behaviour)
+    // and surfaced as 429 rate_limit_exceeded — the previous 503 came from
+    // the buggy "no mark when retryAfter is missing" path.
+    assert.equal(result.status, 429);
     assert.equal(getRpmStats()[account.id].used, 0);
   });
 });
