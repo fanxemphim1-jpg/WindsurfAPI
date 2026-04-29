@@ -1,8 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import http2 from 'http2';
-import { isCascadeTransportError } from '../src/client.js';
-import { chatStreamError, isUpstreamTransientError, redactRequestLogText } from '../src/handlers/chat.js';
+import { isCascadeTransportError, isLocalCascadeTransportError, isUpstreamModelTimeout } from '../src/client.js';
+import { chatStreamError, isUpstreamTransientError, redactRequestLogText, pickBackoffKind, plannedBackoffMs } from '../src/handlers/chat.js';
 import { handleMessages } from '../src/handlers/messages.js';
 
 function parseEvents(raw) {
@@ -68,6 +68,88 @@ describe('stream error protocol', () => {
     // Negative case — a genuine model error must still NOT be classified
     // as transient (otherwise we'd silently retry permanent failures).
     assert.equal(isCascadeTransportError(new Error('permission_denied: model unavailable')), false);
+  });
+
+  it('separates local LS jitter from upstream model-provider timeouts', () => {
+    // Local LS / HTTP/2 jitter — recovers in a few hundred ms.
+    const local = [
+      'pending stream has been canceled',
+      'ECONNRESET',
+      'ERR_HTTP2_STREAM_ERROR',
+      'session closed unexpectedly',
+      'panel state missing on Send',
+    ];
+    for (const msg of local) {
+      const err = new Error(msg);
+      assert.equal(isLocalCascadeTransportError(err), true, `expected local for: ${msg}`);
+      assert.equal(isUpstreamModelTimeout(err), false, `should not be upstream for: ${msg}`);
+      assert.equal(isCascadeTransportError(err), true);
+    }
+    // Upstream model-provider deadline — needs longer rate-shape backoff.
+    const upstream = [
+      'Encountered retryable error from model provider: context deadline exceeded',
+      'Client.Timeout exceeded while awaiting headers',
+      'context cancellation while reading body',
+      'read ETIMEDOUT',
+      'socket hang up',
+      'unexpected EOF',
+    ];
+    for (const msg of upstream) {
+      const err = new Error(msg);
+      assert.equal(isUpstreamModelTimeout(err), true, `expected upstream for: ${msg}`);
+      assert.equal(isLocalCascadeTransportError(err), false, `should not be local for: ${msg}`);
+      assert.equal(isCascadeTransportError(err), true);
+    }
+  });
+
+  it('pickBackoffKind routes to the correct backoff profile', () => {
+    assert.equal(
+      pickBackoffKind(new Error('Encountered retryable error from model provider: context deadline exceeded')),
+      'model_timeout',
+    );
+    assert.equal(
+      pickBackoffKind(new Error('pending stream has been canceled')),
+      'cascade_transport',
+    );
+    assert.equal(
+      pickBackoffKind(new Error('Cascade internal error occurred. Error ID: abc'), { isInternal: true }),
+      'internal_error',
+    );
+    // Unknown error — fall back to internal_error rather than skipping
+    // backoff entirely.
+    assert.equal(
+      pickBackoffKind(new Error('weird unrelated error')),
+      'internal_error',
+    );
+  });
+
+  it('plannedBackoffMs respects per-profile caps and doubles each retry', () => {
+    // cascade_transport: 200, 400, 800, 1500 (cap)
+    assert.equal(plannedBackoffMs(0, 'cascade_transport'), 200);
+    assert.equal(plannedBackoffMs(1, 'cascade_transport'), 400);
+    assert.equal(plannedBackoffMs(2, 'cascade_transport'), 800);
+    assert.equal(plannedBackoffMs(3, 'cascade_transport'), 1500);
+    assert.equal(plannedBackoffMs(10, 'cascade_transport'), 1500);
+
+    // internal_error: 500, 1000, 2000, 4000, 5000 (cap) — preserves legacy.
+    assert.equal(plannedBackoffMs(0, 'internal_error'), 500);
+    assert.equal(plannedBackoffMs(3, 'internal_error'), 4000);
+    assert.equal(plannedBackoffMs(4, 'internal_error'), 5000);
+    assert.equal(plannedBackoffMs(99, 'internal_error'), 5000);
+
+    // model_timeout: 1000, 2000, 4000, 8000, 12000 (cap).
+    assert.equal(plannedBackoffMs(0, 'model_timeout'), 1000);
+    assert.equal(plannedBackoffMs(1, 'model_timeout'), 2000);
+    assert.equal(plannedBackoffMs(3, 'model_timeout'), 8000);
+    assert.equal(plannedBackoffMs(4, 'model_timeout'), 12000);
+    assert.equal(plannedBackoffMs(99, 'model_timeout'), 12000);
+
+    // Unknown profile falls back to internal_error.
+    assert.equal(plannedBackoffMs(0, 'unknown_profile'), 500);
+
+    // Negative / NaN retryIdx clamps to 0.
+    assert.equal(plannedBackoffMs(-5, 'model_timeout'), 1000);
+    assert.equal(plannedBackoffMs(NaN, 'model_timeout'), 1000);
   });
 
   it('redacts common secret patterns before debug request-body logging', () => {

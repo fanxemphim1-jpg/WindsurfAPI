@@ -4,7 +4,7 @@
  */
 
 import { createHash, randomUUID } from 'crypto';
-import { WindsurfClient, contentToString, isCascadeTransportError } from '../client.js';
+import { WindsurfClient, contentToString, isCascadeTransportError, isLocalCascadeTransportError, isUpstreamModelTimeout } from '../client.js';
 import { getApiKey, acquireAccountByKey, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation } from '../auth.js';
 import { resolveModel, getModelInfo } from '../models.js';
 import { getLsFor, ensureLs } from '../langserver.js';
@@ -82,17 +82,67 @@ function appendAssistantTurn(messages, allText, toolCalls) {
   return [...(messages || []), m];
 }
 
-// Cap exponential backoff before falling over to the next account when
-// upstream Cascade returns "internal error occurred". Without this a
-// 9-account pool hammers the upstream within ~10s and every attempt
-// sees the same transient — the OpenClaw real-scenario probe (#28)
-// caught this as 11/20 failures even though the proxy itself is
-// healthy. With backoff capped at 5s the Nth attempt sees a cooler
-// upstream and has a meaningful chance of succeeding.
-//   retry 0 → 500ms, 1 → 1s, 2 → 2s, 3 → 4s, ≥4 → 5s
-async function internalErrorBackoff(retryIdx) {
-  const ms = Math.min(500 * Math.pow(2, retryIdx), 5000);
-  await new Promise(r => setTimeout(r, ms));
+// Backoff between retry attempts when upstream throws a transient error.
+//
+// We rate-shape differently depending on WHERE the error came from, because
+// the same exponential-cap (legacy 500ms→5s) was either too aggressive for
+// upstream model-provider timeouts (it hammered the same hot upstream
+// within 10s — see OpenClaw probe #28 / 11-of-20 failures) OR too lazy for
+// a local LS HTTP/2 cancel that recovers in ~200ms.
+//
+// Profiles:
+//   cascade_transport — local LS jitter (HTTP/2 stream canceled, ECONNRESET,
+//     panel state churn). Recovers fast once we re-establish the cascade,
+//     so use a tight 200ms→1.5s ramp; longer waits just add latency.
+//   internal_error — upstream Cascade reported "internal_error". Legacy
+//     shape preserved (500ms→5s) — gives the heat window a moment to cool.
+//   model_timeout — upstream model provider deadline exceeded / dropped
+//     body. The provider itself is overloaded; immediately retrying just
+//     piles on. Stretch to 1s→12s with full jitter so concurrent requests
+//     don't all retry at the same instant.
+//
+// Backoff respects an AbortSignal (client disconnect) so we don't hold the
+// connection slot any longer than the client cares about, and uses full
+// jitter [0, raw] to avoid synchronized retry storms across concurrent
+// requests sharing the same account pool.
+const BACKOFF_PROFILES = {
+  cascade_transport: { base: 200,  factor: 2, max: 1500 },
+  internal_error:    { base: 500,  factor: 2, max: 5000 },
+  model_timeout:     { base: 1000, factor: 2, max: 12_000 },
+};
+
+export function pickBackoffKind(err, { isInternal = false } = {}) {
+  if (isUpstreamModelTimeout(err)) return 'model_timeout';
+  if (isLocalCascadeTransportError(err)) return 'cascade_transport';
+  if (isInternal) return 'internal_error';
+  return 'internal_error';
+}
+
+export function plannedBackoffMs(retryIdx, kind) {
+  const p = BACKOFF_PROFILES[kind] || BACKOFF_PROFILES.internal_error;
+  const idx = Math.max(0, retryIdx | 0);
+  return Math.min(p.base * Math.pow(p.factor, idx), p.max);
+}
+
+async function transientBackoff(retryIdx, kind = 'internal_error', signal = null) {
+  if (signal?.aborted) return 0;
+  const raw = plannedBackoffMs(retryIdx, kind);
+  // Full jitter so N concurrent requests retrying the same hot upstream
+  // don't all wake up on the same boundary.
+  const ms = Math.floor(Math.random() * raw);
+  if (ms <= 0) return 0;
+  await new Promise(resolve => {
+    const timer = setTimeout(resolve, ms);
+    if (signal) {
+      const onAbort = () => { clearTimeout(timer); resolve(); };
+      // Use addEventListener if available, fall back to once().
+      if (typeof signal.addEventListener === 'function') {
+        signal.addEventListener('abort', onAbort, { once: true });
+      } else if (typeof signal.once === 'function') {
+        signal.once('abort', onAbort);
+      }
+    }
+  });
   return ms;
 }
 
@@ -1331,8 +1381,9 @@ export async function handleChatCompletions(body, context = {}) {
     // Cascade transient 错误通常是上游或本地 LS 短暂抖动，先退避再切账号，避免连续打爆同一热窗口。
     if (errType === 'upstream_internal_error' || errType === 'upstream_transient_error') {
       internalCount++;
-      const backoffMs = await internalErrorBackoff(internalCount - 1);
-      log.warn(`Chat[${reqId}]: ${acct.email} upstream transient error, waited ${backoffMs}ms before next account`);
+      const kind = result.transientKind || 'internal_error';
+      const backoffMs = await transientBackoff(internalCount - 1, kind);
+      log.warn(`Chat[${reqId}]: ${acct.email} upstream transient (${kind}), waited ${backoffMs}ms before next account`);
       continue;
     }
     // Model not available on this account (permission_denied, etc.)
@@ -1575,12 +1626,18 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         };
       }
     }
+    const transientKind = isTransient ? pickBackoffKind(err, { isInternal }) : null;
     return {
       status: isTransient ? 502 : (err.isModelError ? 403 : 502),
       reuseEntryInvalid: !!err.reuseEntryInvalid,
+      // Propagate the backoff kind to the dispatch loop so it can rate-shape
+      // the next retry on the right schedule (model_timeout vs cascade_transport
+      // vs internal_error). Without this the loop only sees errType =
+      // 'upstream_transient_error' and falls back to the legacy profile.
+      transientKind,
       body: { error: {
         message: isTransient
-          ? upstreamTransientErrorMessage(model, 1, isTransport ? 'cascade_transport' : 'internal_error')
+          ? upstreamTransientErrorMessage(model, 1, transientKind === 'cascade_transport' ? 'cascade_transport' : 'internal_error')
           : sanitizeText(err.message),
         type: isTransient ? 'upstream_transient_error' : (err.isModelError ? 'model_not_available' : 'upstream_error'),
       } },
@@ -2024,8 +2081,12 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
               const tag = isRateLimit ? 'rate_limit' : isTransient ? 'upstream_transient' : 'model_error';
               if (isTransient) {
                 streamInternalCount++;
-                const backoffMs = await internalErrorBackoff(streamInternalCount - 1);
-                log.warn(`Chat[${reqId}] stream: ${acct.email} upstream transient error (${isTransport ? 'cascade_transport' : 'internal_error'}), waited ${backoffMs}ms before next account`);
+                const kind = pickBackoffKind(err, { isInternal });
+                // Pass the abort signal so a client disconnect during the
+                // backoff wait drops the slot immediately instead of
+                // holding it for up to 12s on a model_timeout backoff.
+                const backoffMs = await transientBackoff(streamInternalCount - 1, kind, abortController.signal);
+                log.warn(`Chat[${reqId}] stream: ${acct.email} upstream transient (${kind}), waited ${backoffMs}ms before next account`);
               } else {
                 log.warn(`Account ${acct.email} failed (${tag}) on ${model}, trying next`);
               }
