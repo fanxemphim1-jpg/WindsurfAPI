@@ -47,6 +47,40 @@ describe('resolveModel', () => {
   });
 });
 
+describe('resolveModel Opus 4.7 / legacy alias coverage', () => {
+  it('resolves Opus 4.7 aliases to canonical catalog keys', () => {
+    assert.equal(resolveModel('claude-opus-4.7'), 'claude-opus-4-7-medium');
+    assert.equal(resolveModel('claude-opus-4.7-thinking'), 'claude-opus-4-7-medium-thinking');
+    assert.equal(resolveModel('claude-opus-4.7-high-thinking'), 'claude-opus-4-7-high-thinking');
+    assert.equal(resolveModel('claude-Opus-4.7'), 'claude-opus-4-7-medium');
+    assert.equal(resolveModel('CLAUDE-OPUS-4.7'), 'claude-opus-4-7-medium');
+    assert.equal(resolveModel('claude.opus.4.7'), 'claude.opus.4.7');
+  });
+
+  it('documents unsupported bare / separator variants explicitly', () => {
+    // Underscores aren't a recognized separator
+    assert.equal(resolveModel('claude_opus_4_7'), 'claude_opus_4_7');
+    // Bare `opus-4.7-xhigh` (no `claude-` prefix on a tier-suffix variant) — not aliased
+    assert.equal(resolveModel('opus-4.7-xhigh'), 'opus-4.7-xhigh');
+    // Too bare to disambiguate (sonnet vs opus)
+    assert.equal(resolveModel('4.7-medium'), '4.7-medium');
+    // Note: `opus-4.7-thinking` IS now supported (added by spark-C audit alongside `o4.7`).
+    // See test/models-catalog-correctness.test.js for the positive assertion.
+  });
+});
+
+describe('reverse-lookup model info coverage', () => {
+  it('resolves kimi-k2-thinking, glm-4.7-fast, and adaptive', () => {
+    const modelKeys = ['kimi-k2-thinking', 'glm-4.7-fast', 'adaptive'];
+    for (const raw of modelKeys) {
+      const resolved = resolveModel(raw);
+      const info = getModelInfo(resolved);
+      assert.ok(info, `missing model info for ${raw}`);
+      assert.equal(info.name, resolved, `info.name mismatch for ${raw}`);
+    }
+  });
+});
+
 describe('getModelInfo', () => {
   it('returns model info for known model', () => {
     const info = getModelInfo('gpt-4o');
