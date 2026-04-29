@@ -851,6 +851,36 @@ export function reportInternalError(apiKey) {
     const quarantineMs = _internalErrorQuarantineMs();
     account.rateLimitedUntil = Date.now() + quarantineMs;
     log.warn(`Account ${account.id} (${account.email}) quarantined ${Math.round(quarantineMs/60000)}min after ${account.internalErrorStreak} consecutive upstream internal errors`);
+    // Proactively refresh the Firebase token — persistent internal errors
+    // sometimes reflect a stale/expired API key rather than a genuine
+    // upstream outage. If the refresh produces a new API key the next
+    // attempt after quarantine will use it automatically. Fire-and-forget
+    // so we don't block the request path.
+    _tryRefreshOnPersistentError(account);
+  }
+}
+
+async function _tryRefreshOnPersistentError(account) {
+  if (!account.refreshToken) return;
+  // Don't double-fire if we already refreshed recently for this account.
+  const now = Date.now();
+  if (account._lastErrorRefreshAt && now - account._lastErrorRefreshAt < 60_000) return;
+  account._lastErrorRefreshAt = now;
+  try {
+    const { refreshFirebaseToken, reRegisterWithCodeium } = await import('./dashboard/windsurf-login.js');
+    const proxy = getEffectiveProxy(account.id) || null;
+    const { idToken, refreshToken: newRefresh } = await refreshFirebaseToken(account.refreshToken, proxy);
+    account.refreshToken = newRefresh;
+    const { apiKey } = await reRegisterWithCodeium(idToken, proxy);
+    if (apiKey && apiKey !== account.apiKey) {
+      log.info(`Error-triggered refresh: ${account.email} got new API key — persistent internal errors may resolve`);
+      account.apiKey = apiKey;
+    } else {
+      log.info(`Error-triggered refresh: ${account.email} token refreshed (API key unchanged)`);
+    }
+    saveAccounts();
+  } catch (e) {
+    log.warn(`Error-triggered refresh ${account.email} failed: ${e.message}`);
   }
 }
 
