@@ -718,17 +718,35 @@ export function reportSuccess(apiKey) {
 
 /**
  * Report an upstream "internal error occurred (error ID: ...)" from Windsurf.
- * These are account-specific backend errors — a given key will keep hitting
- * them until we stop using it. Quarantine the key for 5 minutes after 2
- * consecutive hits so we stop burning user-visible retries on a dead key.
+ * Some of these reflect a genuinely dead account (auth/state corruption) but
+ * many are payload-shape transients — large 1M-token requests, oversized tool
+ * preambles, or temporary upstream model overload. Quarantine after a
+ * configurable streak so an unlucky pair of failures on a healthy account
+ * doesn't take it out of rotation for 5 minutes.
+ *
+ *   INTERNAL_ERROR_STREAK_QUARANTINE  (default 4) — consecutive errors before
+ *                                                   we mark the key down
+ *   INTERNAL_ERROR_QUARANTINE_MS      (default 5 minutes) — how long to hold
  */
+function _internalErrorStreakThreshold() {
+  const n = parseInt(process.env.INTERNAL_ERROR_STREAK_QUARANTINE || '', 10);
+  return Number.isFinite(n) && n >= 1 ? n : 4;
+}
+
+function _internalErrorQuarantineMs() {
+  const n = parseInt(process.env.INTERNAL_ERROR_QUARANTINE_MS || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 5 * 60 * 1000;
+}
+
 export function reportInternalError(apiKey) {
   const account = accounts.find(a => a.apiKey === apiKey);
   if (!account) return;
   account.internalErrorStreak = (account.internalErrorStreak || 0) + 1;
-  if (account.internalErrorStreak >= 2) {
-    account.rateLimitedUntil = Date.now() + 5 * 60 * 1000;
-    log.warn(`Account ${account.id} (${account.email}) quarantined 5min after ${account.internalErrorStreak} consecutive upstream internal errors`);
+  const threshold = _internalErrorStreakThreshold();
+  if (account.internalErrorStreak >= threshold) {
+    const quarantineMs = _internalErrorQuarantineMs();
+    account.rateLimitedUntil = Date.now() + quarantineMs;
+    log.warn(`Account ${account.id} (${account.email}) quarantined ${Math.round(quarantineMs/60000)}min after ${account.internalErrorStreak} consecutive upstream internal errors`);
   }
 }
 

@@ -466,6 +466,86 @@ export function isThinkingRequested(body) {
   return false;
 }
 
+// Sum the byte length of a messages array — counts string content as well as
+// the text fields of structured (image/tool) parts. Image and binary parts are
+// not counted (they don't contribute to the cascade history text budget).
+export function estimateMessagesBytes(messages) {
+  if (!Array.isArray(messages)) return 0;
+  let total = 0;
+  for (const m of messages) {
+    if (!m) continue;
+    const c = m.content;
+    if (typeof c === 'string') {
+      total += Buffer.byteLength(c, 'utf8');
+    } else if (Array.isArray(c)) {
+      for (const p of c) {
+        if (p && typeof p.text === 'string') total += Buffer.byteLength(p.text, 'utf8');
+      }
+    }
+    if (typeof m.reasoning_content === 'string') total += Buffer.byteLength(m.reasoning_content, 'utf8');
+    if (Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        const name = tc?.function?.name || '';
+        const args = tc?.function?.arguments || '';
+        total += Buffer.byteLength(String(name) + String(args), 'utf8');
+      }
+    }
+  }
+  return total;
+}
+
+// Look up a 1M-context variant for a given model key — returns the variant
+// key when one exists in the catalog, null otherwise. Probes both the
+// `<key>-1m` suffix and (for thinking-aware routing) the `<base>-thinking-1m`
+// pattern so a thinking request on `claude-sonnet-4.6` can also route to
+// `claude-sonnet-4.6-thinking-1m`.
+export function findOneMillionVariant(modelKey) {
+  if (!modelKey) return null;
+  if (/(?:^|[-_])1m(?:[-_]|$)/i.test(modelKey)) return modelKey;
+  const direct = `${modelKey}-1m`;
+  if (getModelInfo(direct)) return direct;
+  const m = modelKey.match(/^(.+?)(-thinking)?$/i);
+  if (m) {
+    const base = m[1];
+    const thinking = m[2] || '';
+    const candidate = thinking ? `${base}${thinking}-1m` : `${base}-thinking-1m`;
+    if (thinking && getModelInfo(candidate)) return candidate;
+  }
+  return null;
+}
+
+// Decide whether to transparently route a request from a base model to its
+// 1M-context sibling when the assembled payload exceeds what the base model
+// can comfortably ingest. Off by default to preserve credit semantics — set
+// `CASCADE_AUTO_ROUTE_1M=true` to opt in, with the byte threshold tunable
+// via `CASCADE_AUTO_ROUTE_1M_BYTES` (default 400_000 ≈ 100K tokens).
+export function shouldAutoRouteOneMillion({ payloadBytes, baseModelKey, hasOneMVariant }) {
+  if (!hasOneMVariant) return false;
+  const flag = String(process.env.CASCADE_AUTO_ROUTE_1M || '').toLowerCase();
+  if (flag !== '1' && flag !== 'true' && flag !== 'yes') return false;
+  if (/(?:^|[-_])1m(?:[-_]|$)/i.test(String(baseModelKey || ''))) return false;
+  const threshold = positiveIntEnv('CASCADE_AUTO_ROUTE_1M_BYTES', 400_000);
+  return payloadBytes >= threshold;
+}
+
+// Tool preamble soft/hard byte caps, scaled by whether the routing model is a
+// 1M-context variant. The upstream LS panel-state ceiling is ~30KB total, so
+// the non-1m soft cap (24KB default) leaves ~6KB headroom for the system
+// prompt. 1m models tolerate larger panel states (the upstream provider is
+// already configured for huge contexts), so we let the preamble grow to keep
+// full schemas instead of dropping to schema-compact.
+export function toolPreambleCapsForModel(modelKey) {
+  const oneM = /(?:^|[-_])1m(?:[-_]|$)/i.test(String(modelKey || ''));
+  const softDefault = oneM ? 64_000 : 24_000;
+  const hardDefault = oneM ? 96_000 : 48_000;
+  const softEnvName = oneM ? 'TOOL_PREAMBLE_SOFT_BYTES_1M' : 'TOOL_PREAMBLE_SOFT_BYTES';
+  const hardEnvName = oneM ? 'TOOL_PREAMBLE_HARD_BYTES_1M' : 'TOOL_PREAMBLE_HARD_BYTES';
+  return {
+    softBytes: positiveIntEnv(softEnvName, softDefault),
+    hardBytes: positiveIntEnv(hardEnvName, hardDefault),
+  };
+}
+
 export function shouldUseCascadeReuse({ useCascade, emulateTools, modelKey, allowToolReuse = OPUS47_TOOL_EMULATED_REUSE }) {
   if (!useCascade) return false;
   if (!emulateTools) return true;
@@ -985,6 +1065,26 @@ export async function handleChatCompletions(body, context = {}) {
   if (effectiveModelKey !== modelKey) {
     log.info(`Chat[${reqId}]: routed ${modelKey} -> ${effectiveModelKey} (wantThinking=${wantThinking})`);
   }
+  // Auto-route oversize payloads to the 1M-context sibling when one exists
+  // and the caller has opted in via CASCADE_AUTO_ROUTE_1M. This avoids the
+  // upstream "internal error occurred" that surfaces when a base 200K model
+  // is asked to ingest a near-full panel state plus large history. Off by
+  // default to preserve credit semantics — 1m variants typically charge a
+  // higher credit multiplier (e.g. claude-sonnet-4.6-1m is 12 vs 4 for the
+  // base sonnet-4.6).
+  {
+    const oneMCandidate = findOneMillionVariant(effectiveModelKey);
+    const payloadBytes = estimateMessagesBytes(messages);
+    if (oneMCandidate && oneMCandidate !== effectiveModelKey
+        && shouldAutoRouteOneMillion({
+          payloadBytes,
+          baseModelKey: effectiveModelKey,
+          hasOneMVariant: !!oneMCandidate,
+        })) {
+      log.info(`Chat[${reqId}]: auto-routed ${effectiveModelKey} -> ${oneMCandidate} (payload ${Math.round(payloadBytes/1024)}KB exceeds CASCADE_AUTO_ROUTE_1M_BYTES)`);
+      effectiveModelKey = oneMCandidate;
+    }
+  }
   const routingModelKey = effectiveModelKey;
   const modelInfo = getModelInfo(effectiveModelKey) || getModelInfo(modelKey);
   // Reject unknown models. Without this, chat.js used to fall through to
@@ -1051,7 +1151,8 @@ export async function handleChatCompletions(body, context = {}) {
   // hard cap; v2.0.9 rejected on the full-schema size before compacting,
   // which broke real opencode / Claude Code setups with 30-50 MCP tools.
   if (emulateTools) {
-    const budget = applyToolPreambleBudget(tools || [], tool_choice, callerEnv);
+    const caps = toolPreambleCapsForModel(routingModelKey);
+    const budget = applyToolPreambleBudget(tools || [], tool_choice, callerEnv, caps);
     preambleTier = budget.tier;
     if (budget.compacted) {
       log.warn(`Probe[${reqId}]: toolPreamble ${Math.round(budget.fullBytes / 1024)}KB exceeds soft cap ${Math.round(budget.softBytes / 1024)}KB; using ${budget.tier} tier (${Math.round(budget.finalBytes / 1024)}KB, ${(tools || []).length} tools)`);

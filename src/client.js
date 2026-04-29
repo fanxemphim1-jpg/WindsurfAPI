@@ -180,12 +180,59 @@ function positiveIntEnv(name, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-function cascadeHistoryBudget(modelUid) {
-  const normal = positiveIntEnv('CASCADE_MAX_HISTORY_BYTES', 200_000);
-  if (/\b1m\b|[-_]1m$/i.test(String(modelUid || ''))) {
-    return positiveIntEnv('CASCADE_1M_HISTORY_BYTES', 900_000);
+// Default per-model history budgets. Numbers are *byte* budgets for the
+// assembled cascade history text and are sized to fit the upstream model's
+// context window, leaving headroom for the system prompt, tool preamble,
+// and output tokens. Pre-v2.0.30 used a single 200_000 budget for every
+// non-1m model, which capped histories at ~50K tokens — far below what
+// Sonnet/Opus 200K models can handle. Override individual entries via the
+// `CASCADE_HISTORY_BUDGETS` env (JSON map of substring → bytes).
+const DEFAULT_HISTORY_BUDGETS = [
+  // 1M-context variants — explicit suffix wins over the regex fallback
+  { match: /\b1m\b|[-_]1m(?:[-_]|$)/i,                              bytes: 3_500_000 },
+  // Anthropic 200K-context family (UIDs may be hyphenated or MODEL_CLAUDE_* with underscores)
+  { match: /claude[-_](?:opus|sonnet|haiku)|claude[-_]3[._]|claude[-_]4/i, bytes: 600_000 },
+  // OpenAI long-context families (GPT-5.1, GPT-5.2) — [-._] handles both
+  // dot-separated keys (gpt-5.2) and underscore-separated UIDs (MODEL_GPT_5_2_*)
+  { match: /gpt[-_]5[-._]2|gpt[-_]5[-._]1/i,                       bytes: 600_000 },
+  { match: /gpt[-_]5/i,                                              bytes: 400_000 },
+  // Google Gemini 2.x — typically 1M+ context; [-_] matches both gemini-2 keys
+  // and MODEL_GOOGLE_GEMINI_2_* UIDs
+  { match: /gemini[-_]2/i,                                          bytes: 1_500_000 },
+];
+
+function readHistoryBudgetOverrides() {
+  const raw = process.env.CASCADE_HISTORY_BUDGETS;
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+    return Object.entries(parsed)
+      .filter(([, v]) => Number.isFinite(Number(v)) && Number(v) > 0)
+      .map(([k, v]) => ({ match: new RegExp(k, 'i'), bytes: Number(v) }));
+  } catch (e) {
+    log.warn(`CASCADE_HISTORY_BUDGETS: invalid JSON, ignoring (${e.message})`);
+    return [];
   }
-  return normal;
+}
+
+export function cascadeHistoryBudget(modelUid) {
+  const fallback = positiveIntEnv('CASCADE_MAX_HISTORY_BYTES', 600_000);
+  const oneM = positiveIntEnv('CASCADE_1M_HISTORY_BYTES', 3_500_000);
+  const uid = String(modelUid || '');
+  const overrides = readHistoryBudgetOverrides();
+  for (const entry of overrides) {
+    if (entry.match.test(uid)) return entry.bytes;
+  }
+  for (const entry of DEFAULT_HISTORY_BUDGETS) {
+    if (entry.match.test(uid)) {
+      // Honor the legacy CASCADE_1M_HISTORY_BYTES env when the 1m suffix
+      // is what matched, so existing deployments that tuned that knob
+      // continue to work.
+      return entry.bytes === 3_500_000 ? oneM : entry.bytes;
+    }
+  }
+  return fallback;
 }
 
 const CASCADE_TIMEOUTS = {
