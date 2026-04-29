@@ -19,17 +19,29 @@ test('cascadeHistoryBudget — defaults match the per-family budget table', () =
   assert.equal(cascadeHistoryBudget('claude-sonnet-4-6-1m'), 3_500_000);
   assert.equal(cascadeHistoryBudget('claude-sonnet-4-6-thinking-1m'), 3_500_000);
 
-  // Anthropic 200K-context family gets 600KB
+  // Anthropic 200K-context family gets 600KB — both model keys and UIDs
   assert.equal(cascadeHistoryBudget('claude-sonnet-4-6'), 600_000);
   assert.equal(cascadeHistoryBudget('claude-opus-4-7-medium'), 600_000);
   assert.equal(cascadeHistoryBudget('claude-3.7-sonnet'), 600_000);
+  // Actual modelUid values (underscore format)
+  assert.equal(cascadeHistoryBudget('MODEL_CLAUDE_4_SONNET'), 600_000);
+  assert.equal(cascadeHistoryBudget('MODEL_CLAUDE_4_5_OPUS'), 600_000);
 
-  // OpenAI long-context families
+  // OpenAI long-context families — both model keys and UIDs
   assert.equal(cascadeHistoryBudget('gpt-5.2'), 600_000);
   assert.equal(cascadeHistoryBudget('gpt-5.1-mini'), 600_000);
+  // Actual modelUid values (MODEL_GPT_* format)
+  assert.equal(cascadeHistoryBudget('MODEL_GPT_5_2_MEDIUM'), 600_000);
+  assert.equal(cascadeHistoryBudget('MODEL_GPT_5_1_CODEX_LOW'), 600_000);
 
-  // Gemini 2.x — 1.5M
+  // GPT-5 base (400KB) — model keys and UIDs
+  assert.equal(cascadeHistoryBudget('gpt-5-codex'), 400_000);
+  assert.equal(cascadeHistoryBudget('MODEL_CHAT_GPT_5_CODEX'), 400_000);
+
+  // Gemini 2.x — 1.5M — both model keys and UIDs
   assert.equal(cascadeHistoryBudget('gemini-2.5-pro'), 1_500_000);
+  assert.equal(cascadeHistoryBudget('MODEL_GOOGLE_GEMINI_2_5_PRO'), 1_500_000);
+  assert.equal(cascadeHistoryBudget('MODEL_GOOGLE_GEMINI_2_5_FLASH'), 1_500_000);
 
   // Unknown model falls back to env default (600K)
   assert.equal(cascadeHistoryBudget('mystery-model-999'), 600_000);

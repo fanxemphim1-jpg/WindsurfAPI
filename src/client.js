@@ -190,13 +190,15 @@ function positiveIntEnv(name, fallback) {
 const DEFAULT_HISTORY_BUDGETS = [
   // 1M-context variants — explicit suffix wins over the regex fallback
   { match: /\b1m\b|[-_]1m(?:[-_]|$)/i,                              bytes: 3_500_000 },
-  // Anthropic 200K-context family
-  { match: /claude-(?:opus|sonnet|haiku)|claude-3\.|claude-4/i,     bytes: 600_000 },
-  // OpenAI long-context families (GPT-5, GPT-5.1, GPT-5.2)
-  { match: /gpt-5\.2|gpt-5\.1/i,                                    bytes: 600_000 },
-  { match: /gpt-5(?!\.)/i,                                          bytes: 400_000 },
-  // Google Gemini 2.x — typically 1M+ context
-  { match: /gemini-2/i,                                             bytes: 1_500_000 },
+  // Anthropic 200K-context family (UIDs may be hyphenated or MODEL_CLAUDE_* with underscores)
+  { match: /claude[-_](?:opus|sonnet|haiku)|claude[-_]3[._]|claude[-_]4/i, bytes: 600_000 },
+  // OpenAI long-context families (GPT-5.1, GPT-5.2) — [-._] handles both
+  // dot-separated keys (gpt-5.2) and underscore-separated UIDs (MODEL_GPT_5_2_*)
+  { match: /gpt[-_]5[-._]2|gpt[-_]5[-._]1/i,                       bytes: 600_000 },
+  { match: /gpt[-_]5/i,                                              bytes: 400_000 },
+  // Google Gemini 2.x — typically 1M+ context; [-_] matches both gemini-2 keys
+  // and MODEL_GOOGLE_GEMINI_2_* UIDs
+  { match: /gemini[-_]2/i,                                          bytes: 1_500_000 },
 ];
 
 function readHistoryBudgetOverrides() {
