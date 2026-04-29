@@ -31,24 +31,34 @@ import {
 
 const LS_SERVICE = '/exa.language_server_pb.LanguageServerService';
 
-// Patterns that mean "the upstream transport / Cascade session blew up,
-// retry on a different account/cascade is safe and expected".
-//
-// Includes:
-//   - Local LS / HTTP/2 jitter (pending stream canceled, session/stream
-//     closed, ERR_HTTP2*, ECONNRESET, panel state churn).
-//   - Upstream-classified retryable errors. Codeium streams these back as
-//     `Encountered retryable error from model provider: context deadline
-//     exceeded (Client.Timeout or context cancellation while reading body)`
-//     when the model provider drops the long-poll body — without this
-//     classification the chat retry loop misses err.isModelError, declines
-//     to try another account, and surfaces "upstream_error" to the client
-//     even though a fresh account would almost certainly succeed.
-const TRANSPORT_ERROR_RE = /pending stream has been canceled|ECONNRESET|ERR_HTTP2|session closed|stream closed|panel state|context deadline exceeded|client\.timeout|context cancellation|retryable error from model provider|read ETIMEDOUT|socket hang up|unexpected eof/i;
+// Local-side / Cascade transport jitter — short-lived issues with our LS
+// session or the gRPC link to it. These almost always recover within
+// hundreds of milliseconds because we just close the panel state and
+// re-establish the cascade.
+const LOCAL_TRANSPORT_RE = /pending stream has been canceled|ECONNRESET|ERR_HTTP2|session closed|stream closed|panel state/i;
+
+// Upstream model-provider timeouts and retryable errors. Codeium wraps these
+// in messages like:
+//   "Encountered retryable error from model provider: context deadline
+//    exceeded (Client.Timeout or context cancellation while reading body)"
+// They mean the model provider (OpenAI / Anthropic / Google etc.) timed out
+// reading the response body. Retrying on a fresh account usually works, but
+// the upstream itself is throttled or backed-up — caller should rate-shape
+// (longer backoff) instead of immediately hammering the next account.
+const UPSTREAM_TIMEOUT_RE = /context deadline exceeded|client\.timeout|context cancellation|retryable error from model provider|read ETIMEDOUT|socket hang up|unexpected eof/i;
+
+export function isLocalCascadeTransportError(err) {
+  const msg = String(err?.message || err || '');
+  return LOCAL_TRANSPORT_RE.test(msg);
+}
+
+export function isUpstreamModelTimeout(err) {
+  const msg = String(err?.message || err || '');
+  return UPSTREAM_TIMEOUT_RE.test(msg);
+}
 
 export function isCascadeTransportError(err) {
-  const msg = String(err?.message || err || '');
-  return TRANSPORT_ERROR_RE.test(msg);
+  return isLocalCascadeTransportError(err) || isUpstreamModelTimeout(err);
 }
 
 function markCascadeTransportError(err) {
