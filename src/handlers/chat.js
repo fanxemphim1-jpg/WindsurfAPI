@@ -5,7 +5,7 @@
 
 import { createHash, randomUUID } from 'crypto';
 import { WindsurfClient, contentToString, isCascadeTransportError, isLocalCascadeTransportError, isUpstreamModelTimeout } from '../client.js';
-import { getApiKey, acquireAccountByKey, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation } from '../auth.js';
+import { getApiKey, acquireAccountByKey, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, recordHealthEvent } from '../auth.js';
 import { resolveModel, getModelInfo } from '../models.js';
 import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
@@ -1634,6 +1634,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     }
 
     reportSuccess(apiKey);
+    recordHealthEvent(apiKey, true);
     updateCapability(apiKey, modelKey, true, 'success');
     recordRequest(model, true, Date.now() - startTime, apiKey);
 
@@ -1696,6 +1697,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     if (err.isModelError && err.kind !== 'transient_stall' && !isRateLimit && !isInternal && !isTransport) {
       updateCapability(apiKey, modelKey, false, 'model_error');
     }
+    recordHealthEvent(apiKey, false);
     recordRequest(model, false, Date.now() - startTime, apiKey);
     log.error('Chat error:', err.message);
     // Rate limits → 429 with Retry-After; model errors → 403; others → 502
@@ -2119,6 +2121,7 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             }
             // success
             if (hadSuccess) reportSuccess(currentApiKey);
+            recordHealthEvent(currentApiKey, true);
             updateCapability(currentApiKey, modelKey, true, 'success');
             recordRequest(model, true, Date.now() - startTime, currentApiKey);
             if (!rolePrinted) {
@@ -2173,6 +2176,7 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             if (err.isModelError && err.kind !== 'transient_stall' && !isRateLimit && !isInternal && !isTransport) {
               updateCapability(currentApiKey, modelKey, false, 'model_error');
             }
+            recordHealthEvent(currentApiKey, false);
             if (isRateLimit && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === currentApiKey) {
               log.info(`Chat[${reqId}]: strict reuse preserved cascade after rate limit`);
               break;

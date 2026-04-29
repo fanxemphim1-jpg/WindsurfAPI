@@ -56,6 +56,87 @@ function rpmLimitFor(account) {
   return TIER_RPM[account.tier || 'unknown'] ?? 20;
 }
 
+// ─── Account health scoring ────────────────────────────────
+//
+// Track recent success/failure events per account in a sliding window.
+// Accounts with higher health scores are preferred during selection,
+// reducing internal_error retries by routing away from accounts that
+// the upstream is currently rejecting.
+//
+// Health events are ephemeral (in-memory only) — no persistence needed
+// since transient upstream conditions change faster than restart cycles.
+const HEALTH_WINDOW_MS = positiveIntEnv('HEALTH_WINDOW_MS', 5 * 60 * 1000);
+
+function _pruneHealthEvents(account, now) {
+  if (!account._healthEvents) account._healthEvents = [];
+  const cutoff = now - HEALTH_WINDOW_MS;
+  while (account._healthEvents.length && account._healthEvents[0].ts < cutoff) {
+    account._healthEvents.shift();
+  }
+}
+
+/**
+ * Record a health event (success or failure) for an account.
+ * Used by chat handlers after each request attempt.
+ */
+export function recordHealthEvent(apiKey, success) {
+  const account = accounts.find(a => a.apiKey === apiKey);
+  if (!account) return;
+  if (!account._healthEvents) account._healthEvents = [];
+  account._healthEvents.push({ ts: Date.now(), ok: success });
+  // Cap the array to avoid unbounded growth in high-traffic scenarios.
+  if (account._healthEvents.length > 200) {
+    account._healthEvents = account._healthEvents.slice(-100);
+  }
+}
+
+/**
+ * Compute a health score for an account: ratio of successes in the
+ * recent sliding window.  Returns 1.0 for accounts with no history
+ * (benefit of the doubt) and 0.0 for accounts that failed every
+ * recent request.
+ */
+export function accountHealthScore(apiKey) {
+  const account = accounts.find(a => a.apiKey === apiKey);
+  if (!account) return 0;
+  _pruneHealthEvents(account, Date.now());
+  const events = account._healthEvents || [];
+  if (events.length === 0) return 1.0;
+  const successes = events.filter(e => e.ok).length;
+  return successes / events.length;
+}
+
+// ─── Credit-aware account selection ────────────────────────
+//
+// Accounts whose credits are exhausted (promptCreditsUsed >= monthlyPromptCredits
+// when monthlyPromptCredits > 0) are deprioritized — not excluded, because the
+// cached credit snapshot may be stale (15-minute refresh cycle). The upstream
+// will reject the request anyway if credits are truly gone, and the retry loop
+// will move to the next account.
+
+function _creditRemainingRatio(account) {
+  // userStatus (from GetUserStatus) is the authoritative credit snapshot —
+  // check it first before falling back to refreshCredits data.
+  const us = account.userStatus;
+  if (us && us.monthlyPromptCredits > 0) {
+    const remaining = Math.max(0, us.monthlyPromptCredits - (us.promptCreditsUsed || 0));
+    return remaining / us.monthlyPromptCredits;
+  }
+  // Fallback to refreshCredits snapshot
+  const c = account.credits;
+  if (c && c.limit > 0) {
+    const remaining = typeof c.remaining === 'number' ? c.remaining : Math.max(0, c.limit - (c.used || 0));
+    return remaining / c.limit;
+  }
+  return 1.0; // no quota info → assume available
+}
+
+export function hasCreditsRemaining(apiKey) {
+  const account = accounts.find(a => a.apiKey === apiKey);
+  if (!account) return false;
+  return _creditRemainingRatio(account) > 0;
+}
+
 function pruneRpmHistory(account, now) {
   if (!account._rpmHistory) account._rpmHistory = [];
   const cutoff = now - RPM_WINDOW_MS;
@@ -498,14 +579,37 @@ export function getApiKey(excludeKeys = [], modelKey = null) {
   }
   if (candidates.length === 0) return null;
 
-  // Pick the account with the fewest in-flight requests first (so a burst
-  // of concurrent calls spreads across accounts instead of piling onto a
-  // single one that still has RPM headroom — see issue #37). Then prefer
-  // accounts with the highest remaining-ratio, finally least-recently-used.
+  // Enrich each candidate with health and credit scores for sorting.
+  for (const c of candidates) {
+    _pruneHealthEvents(c.account, now);
+    const events = c.account._healthEvents || [];
+    c.health = events.length === 0 ? 1.0 : events.filter(e => e.ok).length / events.length;
+    c.creditRatio = _creditRemainingRatio(c.account);
+  }
+
+  // Sort priority (highest priority = first):
+  //   1. Credit availability — accounts with credits remaining go first.
+  //      Depleted accounts (ratio=0) are pushed to the end so we don't
+  //      burn retry attempts on accounts the upstream will reject.
+  //   2. Health score — prefer accounts with higher recent success rate
+  //      so the first attempt is more likely to succeed, reducing the
+  //      number of transient retries.
+  //   3. In-flight count — spread concurrent requests across accounts
+  //      (issue #37).
+  //   4. RPM remaining ratio — prefer accounts with more headroom.
+  //   5. Least-recently-used — tie-breaker.
   candidates.sort((x, y) => {
+    // Depleted credits last (but don't fully exclude — snapshot may be stale)
+    const cx = x.creditRatio > 0 ? 1 : 0;
+    const cy = y.creditRatio > 0 ? 1 : 0;
+    if (cx !== cy) return cy - cx;
+    // Higher health score first (0.1 tolerance to avoid micro-jitter)
+    if (Math.abs(x.health - y.health) > 0.1) return y.health - x.health;
+    // Fewer in-flight first
     const ix = x.account._inflight || 0;
     const iy = y.account._inflight || 0;
     if (ix !== iy) return ix - iy;
+    // More RPM headroom first
     const rx = (x.limit - x.used) / x.limit;
     const ry = (y.limit - y.used) / y.limit;
     if (ry !== rx) return ry - rx;
